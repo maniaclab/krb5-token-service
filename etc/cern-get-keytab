@@ -1,0 +1,957 @@
+#!/usr/bin/python3
+
+"""utility to generate kerberos keytab files within the CERN environment"""
+import argparse
+import getpass
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import requests
+import yaml
+import urllib3
+
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
+
+# Used for the UserAgent
+cgk_version = '1.2.0'
+
+class SourcePortAdapter(HTTPAdapter):
+    """We could do this with SourceAddressAdapter from python3-requests-toolbelt
+    That would introduce a dependency on epel though ..."""
+
+    def __init__(self, port, *args, **kwargs):
+        self._source_port = port
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False):
+        self.poolmanager = PoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            source_address=("", self._source_port),
+        )
+
+
+def get_dns_name(name, verbose, kdcquery):
+    """Return a DNS record"""
+    try:
+        srvip = socket.gethostbyname(name)
+        try:
+            srvname = socket.gethostbyaddr(srvip)[0]
+            if kdcquery:
+                print_verbose(f"Found KDC: {srvname}", verbose)
+            return srvname
+        except (socket.gaierror, socket.herror):
+            if kdcquery:
+                print_error(
+                    f"Cannot find Domain Controller {name} in DNS"
+                )
+    except socket.gaierror:
+        if kdcquery:
+            print_error(f"Cannot find Domain Controller {name} in DNS")
+    return None
+
+
+def print_verbose(msg, verbose):
+    """Print verbose messages"""
+    if verbose:
+        print(msg)
+
+
+def print_debug(msg, debug):
+    """Print debug messages"""
+    if debug:
+        print(msg)
+
+
+def do_execute(
+    cmd,
+    verbose,
+    print_output=True,
+    can_fail=False,
+    return_output=False,
+    hide_password=True,
+):
+    """Execute a binary"""
+    # Only --user passes --use-service-account
+    if re.search(r"use-service-account", cmd) is not None:
+        ommitted_password = (
+            f"{re.search(r'^.*old-account-password', cmd).group(0)} *********"
+        )
+    else:
+        ommitted_password = cmd
+    if print_output:
+        if hide_password:
+            print_verbose(f"running: {ommitted_password}", verbose)
+        else:
+            print_verbose(f"running: {cmd}", verbose)
+    # pylint: disable=consider-using-with
+    process = subprocess.Popen(
+        cmd, stderr=subprocess.PIPE, shell=True, stdout=subprocess.PIPE
+    )
+    out, err = process.communicate()
+    if len(out) > 0 and print_output:
+        print(out.decode().strip())
+    if process.wait() != 0:
+        if can_fail:
+            return False
+        if hide_password:
+            print_verbose(f"Failed to execute: {ommitted_password}", verbose)
+        else:
+            print_verbose(f"Failed to execute: {cmd}", verbose)
+
+        output = out.decode() + err.decode()
+        if "LDAPConnection" in output:
+
+            match = re.search(r"LDAPConnection.*Connecting to LDAP server:\s*(\S+)", output)
+            ldap_server = match.group(1) if match else "CERN authentication server"
+
+            print(
+                f"Error: Cannot reach {ldap_server}.\n"
+                f"User keytab generation requires a connection to the LDAP server\n"
+                f"which is not available from outside the CERN network.\n"
+                f"Please ensure you are connected to the CERN network or via VPN and try again."
+            )
+
+        sys.exit(process.wait())
+    if len(err) > 0 and print_output:
+        print_verbose(err.decode().strip(), verbose)
+    if return_output:
+        return out.decode().strip()
+    return True
+
+def fixselinux(keytab, verbose):
+    """Fix selinux"""
+    chcon = "/usr/bin/chcon"
+    if (
+        (
+            os.path.exists("/sys/fs/selinux")
+            or
+            os.path.exists("/selinux/status")
+        )
+        and (
+            not os.path.abspath(keytab).startswith('/afs')
+            and
+            not os.path.abspath(keytab).startswith('/eos')
+        )
+        and
+        os.access(chcon, os.R_OK)
+    ):
+        do_execute(
+            f"{chcon} system_u:object_r:krb5_keytab_t:s0 {keytab}", verbose
+        )
+
+def get_keytab_kvno(keytab, verbose):
+    """Return highest KVNO found in a keytab, or None on failure."""
+    if not keytab or not os.path.exists(keytab):
+        return None
+    output = do_execute(
+        f"/usr/bin/klist -k {keytab}",
+        verbose,
+        print_output=False,
+        can_fail=True,
+        return_output=True,
+    )
+    if not output:
+        return None
+
+    max_kvno = None
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Keytab name"):
+            continue
+        # Skip header line (starts with KVNO)
+        if line.upper().startswith("KVNO"):
+            continue
+        match = re.match(r"^(\d+)\s+", line)
+        if not match:
+            continue
+        kvno = int(match.group(1))
+        if max_kvno is None or kvno > max_kvno:
+            max_kvno = kvno
+
+    return max_kvno
+
+
+def get_enctypes(enctypes):
+    """Determine encryption types"""
+    allowedenctypes = {
+        "RC4_HMAC_MD5": 4,
+        "AES128_CTS_HMAC_SHA1": 8,
+        "AES256_CTS_HMAC_SHA1": 16,
+    }
+    encs = 0
+    if "|" in enctypes:
+        for enctype in enctypes.split("|"):
+            if enctype in allowedenctypes:
+                encs += allowedenctypes[enctype]
+            else:
+                print_error(
+                    f"Error: Unknown enctype specified. Allowed ones are: "
+                    f"{'|'.join(allowedenctypes.keys())}"
+                )
+    else:
+        try:
+            encs = allowedenctypes[enctypes]
+        except KeyError:
+            print_error(
+                "Error: Unknown enctype specified. Allowed ones are: "
+                f"{'|'.join(allowedenctypes.keys())}"
+            )
+
+    return encs
+
+
+def call_msktutil(
+    krb5conf,
+    ccache,
+    keytab,
+    kdcserver,
+    principal,
+    hostname,
+    service,
+    enctypes,
+    isolate,
+    userkeytab,
+    userpass,
+    userlogin,
+    alias,
+    cname,
+    remove,
+    verbose,
+    debug,
+    password=False,
+    smbpassword=False,
+):
+    """Call msktutil"""
+    cmd = []
+    if krb5conf:
+        cmd.append(f"KRB5_CONFIG={krb5conf}")
+    if ccache:
+        cmd.append(f"KRB5CCNAME=FILE:{ccache}")
+
+    if not service:
+        service = "host"
+
+    if alias or cname:
+        cmd.append("/usr/sbin/msktutil --update " \
+        "--dont-expire-password --no-canonical-name " \
+        "--dont-update-dnshostname --hostname")
+        if alias:
+            cmd.append(f"{alias}")
+        else:
+            cmd.append(f"{cname}")
+    else:
+        cmd.append("/usr/sbin/msktutil --update --dont-expire-password")
+    if userkeytab:
+        cmd.append("--base OU=Users")
+    elif alias:
+        cmd.append("--base 'DC=cern,DC=ch'")
+    else:
+        cmd.append("--base OU=Computers")
+
+    if verbose:
+        cmd.append("--verbose")
+    if debug:
+        # Yes, this is not a typo
+        cmd.append("--verbose --verbose")
+
+    if isolate:
+        # this option is available on patched msktutil-1.0 only ..
+        cmd.append("--dont-update-dnshostname")
+
+    if remove:
+        cmd.append(f"--remove-service {remove}")
+    else:
+        if not userkeytab and service:
+            cmd.append(f"--service {service}")
+
+    if hostname:
+        cmd.append(f"--hostname {hostname}")
+    else:
+        if not userlogin:
+            # We need to check if the calling host is a dyndns.cern.ch address
+            result = get_dns_name(principal.replace('$',''), verbose, False)
+            if result is not None:
+                if 'dyndns.cern.ch' in result:
+                    cmd.append(
+                        f"--no-canonical-name --hostname {principal.replace('$','')}.cern.ch"
+                    )
+    if keytab:
+        cmd.append(f"--keytab {keytab}")
+    if kdcserver:
+        cmd.append(f"--server {kdcserver}")
+    if enctypes:
+        cmd.append(f"--enctypes {enctypes}")
+    # soft deprecation of arcfour-hmac
+    # If the user hasn't provided enctypes, only request aes128 and aes256 from AD
+    else:
+        cmd.append('--enctypes 24')
+    if smbpassword:
+        cmd.append("--set-samba-secret")
+    if userkeytab:
+        cmd.append("--dont-change-password --use-service-account")
+    if userlogin:
+        cmd.append(f"--account-name {userlogin}")
+    if userpass:
+        cmd.append(f"--old-account-password '{userpass}'")
+    if principal:
+        cmd.append(f"--computer-name {principal.replace('$','')}")
+    # we've had a reset pass call
+    if password:
+        cmd.append(f"--old-account-password '{password}'")
+
+    if do_execute(" ".join(cmd), verbose):
+        fixselinux(keytab, verbose)
+        kvno = get_keytab_kvno(keytab, verbose)
+        print(f"Keytab file saved: {keytab} (kvno {kvno})")
+
+
+def krb5cfgfile(kdcserver, krealm, leavekrb5cfg, debug):
+    """Generate a krb5.conf"""
+    if leavekrb5cfg is False:
+        tfname = generate_temp_file("cgk.krb5.conf.")
+    else:
+        tfname = "/tmp/cgk.krb5.conf"
+    try:
+        # pylint: disable=consider-using-with
+        tfh = open(tfname, "w", encoding="utf-8")
+    except FileNotFoundError:
+        print_error(f"cannot create temporary krb5 config file: {tfname}")
+    try:
+        tfh.writelines(
+            f"[libdefaults]\ndefault_realm={krealm}"
+            "\ndns_lookup_kdc=false\nforwardable=true\nproxiable=true\n[realms]\n"
+            f"{krealm}"
+            "={\nkdc="
+            f"{kdcserver}"
+            "\nadmin_server="
+            f"{kdcserver}"
+            "\n}\n"
+        )
+        print_debug(f"created temporary krb5 config file: {tfname}", debug)
+    except PermissionError as exception:
+        print_error(
+            f"cannot write temp. krb5 config file: {tfname} [{exception}]"
+        )
+    return tfname
+
+
+def print_error(msg):
+    """Print error messages"""
+    print(f"Error: {msg}")
+    sys.exit(1)
+
+
+def generate_temp_file(prefix):
+    """Generate a temp file"""
+    try:
+        # pylint: disable=consider-using-with
+        tfh = tempfile.NamedTemporaryFile(mode="w", prefix=prefix, dir="/tmp")
+        filename = tfh.name
+    except PermissionError:
+        print_error(f"cannot create temporary {prefix} config file")
+    return filename
+
+
+def kinit(principal, keytab, ccache, verbose):
+    """Call kinit"""
+    cmd = f"/usr/bin/kinit -k -t {keytab} -c {ccache} {principal}"
+    if do_execute(cmd, verbose, print_output=False, can_fail=True):
+        return True
+    return False
+
+
+def reset_password(
+    verbose,
+    debug,
+    server,
+    verify_peer,
+    verify_host,
+    alias=None,
+    cname=None,
+    service=None,
+    isolate=None,
+):
+    """Call password reset via REST"""
+    if alias:
+        krb_resource = "ResetComputerPasswordDnsAlias"
+    elif cname:
+        krb_resource = "ResetComputerPasswordCName"
+    else:
+        krb_resource = "ResetComputerPassword"
+
+    if not isolate or not service:
+        service = "host"
+
+    url = f"{server}/api/{krb_resource}/{service}"
+    if alias:
+        # The REST endpoints want a short name
+        if alias.endswith(".cern.ch"):
+            alias = alias[:-8]
+        url = f"{url}/{alias}"
+    if cname:
+        # The REST endpoints want a short name
+        if cname.endswith(".cern.ch"):
+            cname = cname[:-8]
+        url = f"{url}/{cname}"
+    if "HTTPS_PROXY" in os.environ or "https_proxy" in os.environ:
+        krbhost = re.search(r"(?<=://)[\w-]+(?:\.[\w-]+)+\b", url).group(0)
+        print_verbose(
+            f"https proxy detected, instructing call to {krbhost} to ignore the configured proxy",
+            verbose,
+        )
+        os.environ["no_proxy"] = krbhost
+
+    reqtimestamp = time.strftime("%FT%T", time.gmtime())
+    data = {"t": reqtimestamp}
+    headers = {"User-Agent": f"cern-get-keytab/{cgk_version}"}
+
+    # Do we need to fix this?
+    # Python requests doesn't allow the option to not verify_host ...
+    verify = False
+    if verify_peer or verify_host:
+        verify = True
+
+    # Not actually curl :)
+    print_verbose(f"curl GET {url}", verbose)
+    # python requests doesn't have a local port/range option (like curl does)
+    # Let's work around that ...
+    local_port_start = 600
+    local_port_range = 100
+    req = None
+    for port in range(local_port_start, local_port_start + local_port_range):
+        session = requests.Session()
+        session.mount("https://", SourcePortAdapter(port))
+        try:
+            req = session.post(
+                url,
+                json=data,
+                headers=headers,
+                timeout=(10, 60),
+                allow_redirects=True,
+                verify=verify,
+            )
+            if req:
+                results = json.loads(req.content)
+                if results['error'] == 'Error: Host not member of alias.':
+                    print_debug('Call to lxkerbwin with IPv6 failed, falling back to IPv4...',
+                    debug)
+                    urllib3.util.connection.HAS_IPV6 = False
+                    continue
+            break
+        except requests.exceptions.ConnectTimeout as e:
+            print_error(
+                f"connection to lxkerbwin.cern.ch timed out: {e}\n"
+                "this looks like a network/firewall issue rather than a port "
+                "conflict, giving up after first attempt instead of retrying "
+                "all local ports."
+            )
+        except requests.exceptions.ConnectionError as e:
+            print_debug(
+                f"local port {port} was not usable: {e}",
+                debug,
+            )
+        except requests.exceptions.RequestException as exception:
+            print_error(f"cannot reset host password [http err: {exception} ])")
+    if not req:
+        print_error("no ports available. Try running with --debug.")
+    if req.status_code != 200:
+        print_error(
+            f"server error: {req.status_code}, server output:\n{req.content}"
+        )
+    results = json.loads(req.content)
+
+    # Not actually curl :)
+    print_verbose("curl RCV data:", verbose)
+    print_verbose(f"success code: {results['success']}", verbose)
+
+    if results["success"]:
+        print_verbose(f"computer pass: {results['computerpassword']}", verbose)
+        print_verbose(f"samaccountname: {results['samaccountname']}", verbose)
+        print_verbose(f"principalname: {results['principalname']}", verbose)
+    else:
+        print_verbose(f"error string: {results['error']}", verbose)
+        if ('Error checking computer in AD, object not found, '
+                'not in authorized OU or invalid user trying to join domain') in results['error']:
+            short_hostname = socket.gethostname().split('.')[0].upper()
+            print_error(
+                f"Your system does not seem to be correctly registered in landb. "
+                f"Please ensure that 'Linux' is defined for 'Operating system' at "
+                f"https://landb.cern.ch/portal/devices/{short_hostname}"
+            )
+        else:
+            print_error(f"cannot receive/parse server data:{results['error']}")
+
+    if (
+        "computerpassword" not in results.keys()
+        or "samaccountname" not in results.keys()
+    ):
+        print_error("incomplete data received.")
+
+    return results["samaccountname"], results["computerpassword"]
+
+
+
+def check_alpha_numeric(value):
+    """Check if a string is alphanumeric"""
+    match = re.search(r"^[a-zA-Z0-9_-]+$", value)
+    if match is None:
+        print_error(
+            "remove service name can contain only alphanumeric characters ([a-zA-Z0-9_-])."
+        )
+    return value
+
+
+def main():
+    """main"""
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-k",
+        "--keytab",
+        required=False,
+        type=str,
+        action="store",
+        default="/etc/krb5.keytab",
+        help="Stores retrieved keytab in FILENAME rather than default krb5.keytab",
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        required=False,
+        action="store_true",
+        help="Appends new to already existing valid host/service keytab file"
+        ",invalidating current entries.",
+    )
+    parser.add_argument(
+        "-s",
+        "--service",
+        required=False,
+        type=str,
+        action="store",
+        help="Acquires keytab for given service rather than host."
+        " SRVC name is case-sensitive (example common service names: "
+        "HTTP, cvs, ...). See also --isolate option. If not specified "
+        "the default service: host is used.",
+    )
+    parser.add_argument(
+        "-r",
+        "--remove",
+        required=False,
+        type=check_alpha_numeric,
+        action="store",
+        help="Removes keys for named service from Active Directory",
+    )
+    parser.add_argument(
+        "-i",
+        "--isolate",
+        required=False,
+        action="store_true",
+        help="Active Directory provides keytabs for host and services using"
+        " the same encryption keys. This option allows for creating service "
+        "keytab with encyption keys different that host keytab encryption "
+        "keys for improved security. By default such keytabs are stored as "
+        "/etc/krb5.keytab.SRVC unless --keytab option is specified.",
+    )
+    parser.add_argument(
+        "--hostname",
+        required=False,
+        type=str,
+        action="store",
+        help="Use HOSTNAME for requesting Active Directory password reset. "
+        "This option is to be used ONLY when system has multiple interfaces "
+        "/ ip addresses allocated and keytab is required for hostname "
+        "corresponding to a non-default route interface.  System network "
+        "interface corresponding to HOSTNAME must be defined and active before"
+        " running cern-get-keytab with this option specified. This option will"
+        "not function while using DNS host aliases. See next option.",
+    )
+    parser.add_argument(
+        "-a",
+        "--alias",
+        required=False,
+        type=str,
+        action="store",
+        help="Acquire keytab for CERN DNS Dynamic Alias (delegated zone"
+        "/subdomain), or Landb load balancing alias (*--load-X-). This "
+        "operation will only succeed if executed on a system being an "
+        "active member of DNS alias.",
+    )
+    parser.add_argument(
+        "-c",
+        "--cname",
+        required=False,
+        type=str,
+        action="store",
+        help="Acquire keytab for CERN DNS Dynamic Alias (delegated zone"
+        "/subdomain), or Landb load balancing alias (*--load-X-). This "
+        "operation will only succeed if executed on a system being an "
+        "active member of DNS alias.",
+    )
+    parser.add_argument(
+        "-u",
+        "--user",
+        required=False,
+        action="store_true",
+        help="Generate keytab for user account, this option requires "
+        "specifying user account password and optionally user login."
+        " Such keytab can be used for authentication with kinit: # kinit -kt"
+        " /path/to/user.keytab.file login WARNING: store user keytab in a "
+        "protected location: this file contains your user credentials which "
+        "can be used to authenticate until account password is changed.",
+    )
+    parser.add_argument(
+        "-p",
+        "--password",
+        required=False,
+        type=str,
+        action="store",
+        help="User account password for user keytab generation. If not "
+        "provided, will be asked interactively. Special characters in the "
+        "password need to be shell-escaped.",
+    )
+    parser.add_argument(
+        "-l",
+        "--login",
+        required=False,
+        type=str,
+        action="store",
+        help="User account login for user keytab generation."
+        " If not provided the current username is used.",
+    )
+    parser.add_argument(
+        "-e",
+        "--enctypes",
+        required=False,
+        type=str,
+        action="store",
+        help="Specify encryption types to be used for obtained host identity. "
+        "Allowed (and supported on CERN Active Directory) ENCTYPEs are: "
+        "RC4_HMAC_MD5 (RC4) AES128_CTS_HMAC_SHA1a "
+        "(AES128) AES256_CTS_HMAC_SHA1 (AES256) "
+        "Default ENCTYPEs are: RC4_HMAC_MD5|AES128_CTS_HMAC_SHA1|AES256_CTS_HMAC_SHA1",
+    )
+    parser.add_argument(
+        "--passwordsmb",
+        required=False,
+        action="store_true",
+        help="Saves computer account password in Samba secrets database "
+        "(/var/lib/samba/private/secrets.tdb) for use with kerberized "
+        "smbd setup.",
+    )
+    parser.add_argument(
+        "--leavekrb5cfg",
+        required=False,
+        action="store_true",
+        default=False,
+        help="Store used temporary kerberos config file as: /tmp/cgk.krb5.conf "
+        "This can be used by another tool in order to guarantee that same "
+        "Active Directory Domain Controller will be used, therefore "
+        "eliminating the need to wait for (asynchronous) AD replication."
+        " To use from (ba)sh shell: export KRB5_CONFIG=/tmp/cgk.krb5.conf"
+        " Warning: if /tmp/cgk.krb5.conf exists its content will be"
+        "overwritten.",
+    )
+    parser.add_argument(
+        "-t",
+        "--testsrv",
+        required=False,
+        action="store_true",
+        default=False,
+        help="Use development instance of password reset server."
+        " DO NOT USE IN PRODUCTION.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        required=False,
+        action="store_true",
+        help="Display verbose information",
+    )
+    parser.add_argument(
+        "-d",
+        "--debug",
+        required=False,
+        action="store_true",
+        help="Display debug information",
+    )
+
+    # This logic ensures that single dash shortname arguments work
+    new_argv = []
+    for arg in sys.argv:
+        if arg.startswith("-") and not arg.startswith("--") and len(arg) > 2:
+            arg = "-" + str(arg)
+        new_argv.append(str(arg))
+
+    sys.argv = new_argv
+    args = parser.parse_args()
+
+    if os.geteuid() != 0 and not args.user:
+        print_error("You must be 'root' to run this program.")
+    if args.testsrv:
+        print(
+            "--testsrv is deprecated. Please use a configuration file instead."
+        )
+
+    # set defaults, these may be overridden if the user supplied a config file
+    verify_peer = True
+    verify_host = True
+    if args.testsrv:
+        server = "https://lxkerbwindev.cern.ch"
+    else:
+        server = "https://lxkerbwin.cern.ch"
+
+    if "CERN_GET_KEYTAB_CONF" in os.environ:
+        config_file = os.environ["CERN_GET_KEYTAB_CONF"]
+    else:
+        config_file = "/etc/cern-get-keytab.yaml"
+    if os.path.isfile(config_file):
+        with open(config_file, encoding="utf-8") as f:
+            cfy = yaml.safe_load(f)
+        if cfy is not None:
+            if 'verify_peer' in cfy:
+                verify_peer = cfy['verify_peer']
+            if 'verify_host' in cfy:
+                verify_host = cfy['verify_host']
+            if 'server' in cfy:
+                # Ensure no breakage if the old Legacy URL is defined in the config
+                if cfy['server'].endswith("/LxKerb.asmx"):
+                    server = cfy['server'][:-12]
+                else:
+                    server = cfy['server']
+    if args.isolate and not args.service:
+        print_error(
+            "--isolate option must be used together with --service option."
+        )
+
+    if args.service and args.remove:
+        print_error(
+            "only one of --service or --remove can be used at the same time."
+        )
+    if args.enctypes:
+        args.enctypes = get_enctypes(args.enctypes)
+
+    if 'lxkerbwinqa.cern.ch' in server:
+        dcalias = 'cerndcqa.cern.ch'
+    else:
+        dcalias = 'cerndc.cern.ch'
+    kdcserver = get_dns_name(dcalias, args.verbose, True)
+    krealm = "CERN.CH"
+
+    if args.passwordsmb:
+        do_execute(
+            "/usr/libexec/cern-get-keytab-samba-workaround",
+            args.verbose,
+            print_output=True,
+            can_fail=False,
+        )
+
+    print_verbose("Setting up temporary Kerberos config file", args.verbose)
+    krb5config = krb5cfgfile(kdcserver, krealm, args.leavekrb5cfg, args.debug)
+
+    # This is not needed in this python port, however keeping this
+    # to have the same output as the perl version
+    print_verbose("Initializing Kerberos client", args.verbose)
+
+    if not args.user:
+        print_verbose("Authenticating using keytab file.", args.verbose)
+
+    if args.keytab == "/etc/krb5.keytab":
+        if args.user:
+            print_error(
+                "--user option must be used together with --keytab option."
+            )
+        elif args.isolate:
+            args.keytab = f"/etc/krb5.keytab.{args.service}"
+            print_verbose(f"using {args.keytab} as keytab file", args.verbose)
+        else:
+            print_verbose("using default keytab file name.", args.verbose)
+
+    if args.user:
+        if not args.login:
+            args.login = getpass.getuser()
+        if not args.password:
+            args.password = getpass.getpass(
+                prompt=f"Password for {args.login}: "
+            )
+        if len(args.password) == 0:
+            print_error(
+                "A password needs to be entered :)"
+            )
+        call_msktutil(
+            krb5config,
+            None,
+            args.keytab,
+            kdcserver,
+            None,
+            None,
+            None,
+            args.enctypes,
+            None,
+            args.user,
+            args.password,
+            args.login,
+            None,
+            None,
+            None,
+            args.verbose,
+            args.debug,
+            False,
+            False,
+        )
+        sys.exit(0)
+
+    ccache_result = False
+    print_verbose(f"using keytab file name: {args.keytab}", args.verbose)
+    if not os.access(args.keytab, os.R_OK):
+        print_verbose("keytab file not readable.", args.verbose)
+    # OMG, we have a keytab
+    else:
+        ccache_file = generate_temp_file("cgk.ccache.")
+        print_verbose(
+            f"resolving credentials cache ({ccache_file}).", args.verbose
+        )
+        print_verbose(f"resolving keytab file {args.keytab}", args.verbose)
+        print_verbose("scanning keytab file for principal name", args.verbose)
+        principal = False
+        klist = do_execute(
+            f"/usr/bin/klist -k {args.keytab}",
+            args.verbose,
+            return_output=True,
+            print_output=False,
+            can_fail=True,
+        )
+        if not klist:
+            print(f"{args.keytab} is corrupt, removing")
+            try:
+                os.unlink(args.keytab)
+            except FileNotFoundError:
+                pass
+            print("principal name not found")
+        else:
+            for line in klist.splitlines():
+                if re.search(r"^.*\$@CERN\.CH", line):
+                    principal = line.split()[1].split("@")[0]
+                    break
+            if principal is not False:
+                print_verbose(f"found principal name: {principal}", args.verbose)
+                print_verbose(
+                    f"authenticating as: {principal} using keytab file: {args.keytab}.",
+                    args.verbose,
+                )
+                # This is done in MEMORY: on the perl port, not sure if we can do that here ...
+                ccache_result = kinit(
+                    principal, args.keytab, ccache_file, args.verbose
+                )
+
+    if not ccache_result:
+        print_verbose("Authentication using keytab file failed", args.verbose)
+        print_verbose("Requesting password reset", args.verbose)
+        principal, password = reset_password(
+            args.verbose,
+            args.debug,
+            server,
+            verify_peer,
+            verify_host,
+            args.alias,
+            args.cname,
+            args.service,
+            args.isolate,
+        )
+        time_elapsed = 0
+        password_auth = False
+        ccache_file = generate_temp_file("cgk.ccache.")
+        while time_elapsed < 60:
+            print(
+                f"Waiting for password replication ({time_elapsed} seconds past)"
+            )
+            print_verbose(
+                f"authenticating as {principal} using password ({password}).",
+                args.verbose,
+            )
+            print_verbose(
+                f"Authenticating using password (try {int((time_elapsed+5)/5)}/10).",
+                args.verbose,
+            )
+            if do_execute(
+                f"/usr/bin/echo '{password}' | KRB5_CONFIG={krb5config} "
+                f"/usr/bin/kinit -c {ccache_file} {principal}",
+                args.verbose,
+                print_output=False,
+                can_fail=True,
+            ):
+                password_auth = True
+                break
+            time.sleep(5)
+            time_elapsed += 5
+        if password_auth:
+            print_verbose(
+                "Successfully authenticated using password", args.verbose
+            )
+            call_msktutil(
+                krb5config,
+                ccache_file,
+                args.keytab,
+                kdcserver,
+                principal,
+                args.hostname,
+                args.service,
+                args.enctypes,
+                args.isolate,
+                args.user,
+                args.password,
+                args.login,
+                args.alias,
+                args.cname,
+                args.remove,
+                args.verbose,
+                args.debug,
+                password,
+                args.passwordsmb,
+            )
+        else:
+            print("Authentication using keytab file and password failed.")
+            print_error("Cannot get keytab")
+    else:
+        print_verbose(
+            "Successfully authenticated using keytab file", args.verbose
+        )
+        if args.force:
+            call_msktutil(
+                krb5config,
+                ccache_file,
+                args.keytab,
+                kdcserver,
+                principal,
+                args.hostname,
+                args.service,
+                args.enctypes,
+                args.isolate,
+                args.user,
+                args.password,
+                args.login,
+                args.alias,
+                args.cname,
+                args.remove,
+                args.verbose,
+                args.debug,
+                False,
+                args.passwordsmb,
+            )
+        else:
+            print(f"Current keytab file ({args.keytab}) is valid.")
+            print("Use --force to reinitialize.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCtrl+C keypress detected, exiting ...")

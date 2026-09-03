@@ -6,6 +6,7 @@ conftest) — nothing is mocked at the Python level.
 
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -168,6 +169,89 @@ class TestAuthenticationFailures:
             )
         (audit,) = _audit_events(cap_logs)
         assert audit["outcome"] == "denied"
+
+
+@pytest.mark.usefixtures("fake_kinit_keytab")
+class TestMintKeytabMode:
+    async def test_returns_minted_ccache(
+        self,
+        client: httpx.AsyncClient,
+        make_token: Callable[..., str],
+        fake_keytab_bytes: bytes,
+    ) -> None:
+        resp = await client.post(
+            "/v1/mint",
+            headers=_auth(make_token()),
+            json={
+                "username": "gstark",
+                "keytab_b64": base64.b64encode(fake_keytab_bytes).decode(),
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["principal"] == "gstark@CERN.CH"
+
+    async def test_wrong_keytab_is_400(
+        self, client: httpx.AsyncClient, make_token: Callable[..., str]
+    ) -> None:
+        resp = await client.post(
+            "/v1/mint",
+            headers=_auth(make_token()),
+            json={
+                "username": "gstark",
+                "keytab_b64": base64.b64encode(b"totally-wrong").decode(),
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "bad keytab"
+
+    async def test_wrong_keytab_does_not_trip_the_rate_limiter(
+        self,
+        client: httpx.AsyncClient,
+        make_token: Callable[..., str],
+        settings: Settings,
+    ) -> None:
+        for _ in range(settings.failed_auth_max_attempts + 2):
+            resp = await client.post(
+                "/v1/mint",
+                headers=_auth(make_token()),
+                json={
+                    "username": "gstark",
+                    "keytab_b64": base64.b64encode(b"totally-wrong").decode(),
+                },
+            )
+        assert resp.status_code == 400  # still "bad keytab", never 429
+
+    async def test_invalid_base64_is_422(
+        self, client: httpx.AsyncClient, make_token: Callable[..., str]
+    ) -> None:
+        resp = await client.post(
+            "/v1/mint",
+            headers=_auth(make_token()),
+            json={"username": "gstark", "keytab_b64": "not-valid-base64!!"},
+        )
+        assert resp.status_code == 422
+
+
+class TestMintRequestExactlyOneCredential:
+    async def test_both_password_and_keytab_is_422(
+        self, client: httpx.AsyncClient, make_token: Callable[..., str]
+    ) -> None:
+        resp = await client.post(
+            "/v1/mint",
+            headers=_auth(make_token()),
+            json=_body(keytab_b64=base64.b64encode(b"x").decode()),
+        )
+        assert resp.status_code == 422
+
+    async def test_neither_password_nor_keytab_is_422(
+        self, client: httpx.AsyncClient, make_token: Callable[..., str]
+    ) -> None:
+        resp = await client.post(
+            "/v1/mint",
+            headers=_auth(make_token()),
+            json={"username": "gstark"},
+        )
+        assert resp.status_code == 422
 
 
 class TestRequestValidation:

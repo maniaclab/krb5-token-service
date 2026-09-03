@@ -1,0 +1,59 @@
+diff --git a/etc/cern-get-keytab b/etc/cern-get-keytab
+index 907e5cb..00f5e5b 100644
+--- a/etc/cern-get-keytab
++++ b/etc/cern-get-keytab
+@@ -6,6 +6,7 @@ import getpass
+ import json
+ import os
+ import re
++import shlex
+ import socket
+ import subprocess
+ import sys
+@@ -118,6 +119,14 @@ def do_execute(
+                 f"which is not available from outside the CERN network.\n"
+                 f"Please ensure you are connected to the CERN network or via VPN and try again."
+             )
++        elif err:
++            # Surface msktutil's own error (e.g. "Error:
++            # krb5_get_init_creds_password failed: Preauthentication
++            # failed" on a bad password) unconditionally -- previously
++            # this was discarded on failure unless --verbose was passed,
++            # leaving a caller with nothing but a bare exit code to
++            # classify a failure by.
++            print(err.decode().strip(), file=sys.stderr)
+
+         sys.exit(process.wait())
+     if len(err) > 0 and print_output:
+@@ -300,12 +309,12 @@ def call_msktutil(
+     if userlogin:
+         cmd.append(f"--account-name {userlogin}")
+     if userpass:
+-        cmd.append(f"--old-account-password '{userpass}'")
++        cmd.append(f"--old-account-password {shlex.quote(userpass)}")
+     if principal:
+         cmd.append(f"--computer-name {principal.replace('$','')}")
+     # we've had a reset pass call
+     if password:
+-        cmd.append(f"--old-account-password '{password}'")
++        cmd.append(f"--old-account-password {shlex.quote(password)}")
+
+     if do_execute(" ".join(cmd), verbose):
+         fixselinux(keytab, verbose)
+@@ -777,6 +786,16 @@ def main():
+     if args.user:
+         if not args.login:
+             args.login = getpass.getuser()
++        if not args.password:
++            # Non-interactive callers (e.g. a service piping the password
++            # over stdin, matching MIT kinit's own prompter.c: it also
++            # short-circuits on !isatty(fd) rather than reading a redirected
++            # stdin through getpass, which deliberately never does) get a
++            # single line read from stdin instead of the interactive
++            # /dev/tty prompt below, which getpass() would otherwise use
++            # even with stdin redirected.
++            if not sys.stdin.isatty():
++                args.password = sys.stdin.readline().rstrip("\n")
+         if not args.password:
+             args.password = getpass.getpass(
+                 prompt=f"Password for {args.login}: "

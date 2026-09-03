@@ -12,14 +12,19 @@ from typing import TYPE_CHECKING
 import pytest
 from structlog.testing import capture_logs
 
+from krb5_token_service.ccache import CcacheParseError
 from krb5_token_service.minting import (
     AccountUnusableError,
+    BadKeytabError,
     BadPasswordError,
     InvalidLifetimeError,
     InvalidUsernameError,
     MintingError,
+    TicketExpiredError,
     UnknownPrincipalError,
+    mint_keytab,
     mint_ticket,
+    renew_ticket,
     validate_lifetime,
     validate_username,
 )
@@ -29,7 +34,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from krb5_token_service.config import Settings
-    from tests.conftest import FakeKinit
+    from tests.conftest import FakeCernGetKeytab, FakeKinit
 
 
 def _password(text: str = FAKE_CORRECT_PASSWORD) -> bytearray:
@@ -199,3 +204,143 @@ class TestMintTicketInfraFailures:
         settings.kinit_timeout_seconds = 1
         with pytest.raises(MintingError, match="timed out"):
             await mint_ticket("gstark", _password(), "24h", "7d", settings)
+
+
+@pytest.mark.usefixtures("fake_kinit_keytab")
+class TestMintTicketKeytabSuccess:
+    async def test_returns_ccache_and_confirmed_fields(
+        self, settings: Settings, fake_ccache_bytes: bytes, fake_keytab_bytes: bytes
+    ) -> None:
+        minted = await mint_ticket(
+            "gstark", None, "24h", "7d", settings, keytab=bytearray(fake_keytab_bytes)
+        )
+        assert minted.ccache == fake_ccache_bytes
+        assert minted.principal == "gstark@CERN.CH"
+
+    async def test_invoked_with_dash_k_dash_t_and_no_stdin_password(
+        self, settings: Settings, fake_keytab_bytes: bytes, fake_kinit_keytab: FakeKinit
+    ) -> None:
+        await mint_ticket(
+            "gstark", None, "24h", "7d", settings, keytab=bytearray(fake_keytab_bytes)
+        )
+        recorded = fake_kinit_keytab.args_file.read_text().split()
+        assert "-k" in recorded
+        assert recorded[recorded.index("-t") + 1].endswith("keytab")
+        assert recorded[-1] == "gstark@CERN.CH"
+
+    async def test_keytab_buffer_is_zeroed_after_return(
+        self, settings: Settings, fake_keytab_bytes: bytes
+    ) -> None:
+        buf = bytearray(fake_keytab_bytes)
+        await mint_ticket("gstark", None, "24h", "7d", settings, keytab=buf)
+        assert buf == bytearray(len(buf))
+
+
+class TestMintTicketBadKeytab:
+    @pytest.mark.usefixtures("fake_kinit_keytab")
+    async def test_wrong_keytab_raises_bad_keytab_error(
+        self, settings: Settings
+    ) -> None:
+        # BadKeytabError, not BadPasswordError, is what keeps app.py from
+        # ever counting this against the password rate limiter.
+        with pytest.raises(BadKeytabError):
+            await mint_ticket(
+                "gstark",
+                None,
+                "24h",
+                "7d",
+                settings,
+                keytab=bytearray(b"totally-wrong"),
+            )
+
+
+@pytest.mark.usefixtures("fake_kinit_renew")
+class TestRenewTicketSuccess:
+    async def test_returns_the_renewed_ccache_not_the_input(
+        self,
+        settings: Settings,
+        fake_ccache_bytes: bytes,
+        fake_renewed_ccache_bytes: bytes,
+    ) -> None:
+        minted = await renew_ticket(fake_ccache_bytes, settings)
+        assert minted.ccache == fake_renewed_ccache_bytes
+        assert minted.ccache != fake_ccache_bytes
+
+    async def test_invoked_with_dash_r(
+        self, settings: Settings, fake_ccache_bytes: bytes, fake_kinit_renew: FakeKinit
+    ) -> None:
+        await renew_ticket(fake_ccache_bytes, settings)
+        recorded = fake_kinit_renew.args_file.read_text().split()
+        assert "-R" in recorded
+
+
+class TestRenewTicketFailures:
+    async def test_expired_ticket_raises_ticket_expired_error(
+        self, settings: Settings, fake_ccache_bytes: bytes, ticket_expired_kinit: Path
+    ) -> None:
+        del ticket_expired_kinit  # installs the fake binary as a side effect
+        with pytest.raises(TicketExpiredError):
+            await renew_ticket(fake_ccache_bytes, settings)
+
+    async def test_garbage_ccache_raises_ccache_parse_error_before_invoking_kinit(
+        self, settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No fake kinit installed at all: if renew_ticket reached the
+        # subprocess call, the real (or absent) kinit would run instead of
+        # failing cleanly via CcacheParseError.
+        bin_dir = tmp_path / "no-kinit-here"
+        bin_dir.mkdir()
+        monkeypatch.setenv("PATH", str(bin_dir))
+        with pytest.raises(CcacheParseError):
+            await renew_ticket(b"not-a-real-ccache", settings)
+
+
+@pytest.mark.usefixtures("fake_cern_get_keytab")
+class TestMintKeytabSuccess:
+    async def test_returns_keytab_bytes(
+        self, settings: Settings, fake_keytab_bytes: bytes
+    ) -> None:
+        keytab_bytes = await mint_keytab("gstark", _password(), settings)
+        assert keytab_bytes == fake_keytab_bytes
+
+    async def test_invoked_with_expected_flags(
+        self, settings: Settings, fake_cern_get_keytab: FakeCernGetKeytab
+    ) -> None:
+        await mint_keytab("gstark", _password(), settings)
+        recorded = fake_cern_get_keytab.args_file.read_text().split()
+        assert "-u" in recorded
+        assert "-v" in recorded
+        assert recorded[recorded.index("-l") + 1] == "gstark"
+        assert "--keytab" in recorded
+
+    async def test_password_buffer_is_zeroed_after_return(
+        self, settings: Settings
+    ) -> None:
+        buf = _password()
+        await mint_keytab("gstark", buf, settings)
+        assert buf == bytearray(len(buf))
+
+    async def test_no_log_line_ever_contains_the_password(
+        self, settings: Settings
+    ) -> None:
+        with capture_logs() as cap_logs:
+            await mint_keytab("gstark", _password(), settings)
+        assert FAKE_CORRECT_PASSWORD not in repr(cap_logs)
+
+
+class TestMintKeytabBadPassword:
+    @pytest.mark.usefixtures("fake_cern_get_keytab")
+    async def test_wrong_password_raises_bad_password_error(
+        self, settings: Settings
+    ) -> None:
+        with pytest.raises(BadPasswordError):
+            await mint_keytab("gstark", _password("totally-wrong"), settings)
+
+    @pytest.mark.usefixtures("fake_cern_get_keytab")
+    async def test_password_buffer_is_zeroed_even_on_failure(
+        self, settings: Settings
+    ) -> None:
+        buf = _password("totally-wrong")
+        with pytest.raises(BadPasswordError):
+            await mint_keytab("gstark", buf, settings)
+        assert buf == bytearray(len(buf))
