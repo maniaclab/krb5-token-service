@@ -31,11 +31,15 @@ _CONFIG_ENTRY_REALM = b"X-CACHECONF:"
 
 
 class CcacheParseError(Exception):
-    """Raised when the just-minted ccache carries no usable TGT.
+    """Raised when *path* isn't a ccache pykrb5 can read, or carries no usable TGT.
 
-    Should not happen for a ccache kinit itself just wrote successfully; if
-    it does, the ccache is unusable and this is treated as an infra failure
-    like any other minting error.
+    The former (bytes that aren't even a valid ccache at all — krb5.Krb5Error
+    from pykrb5 itself, e.g. "Bad version number") matters for renew_ticket,
+    whose input is caller-supplied, not something this service just minted:
+    that case is a 422 the caller can fix, not a kinit failure to classify.
+    The latter should not happen for a ccache kinit itself just wrote
+    successfully; if it does, the ccache is unusable and this is treated as
+    an infra failure like any other minting error.
     """
 
 
@@ -56,26 +60,29 @@ def read_ccache(path: Path) -> CcacheInfo:
     lifetime/renewable_lifetime (the KDC may cap either below what was asked
     for).
     """
-    ctx = krb5.init_context()
-    cc = krb5.cc_resolve(ctx, f"FILE:{path}".encode())
-    principal = krb5.cc_get_principal(ctx, cc)
-    realm = principal.realm.decode()
-    tgt_server = f"krbtgt/{realm}@{realm}"
+    try:
+        ctx = krb5.init_context()
+        cc = krb5.cc_resolve(ctx, f"FILE:{path}".encode())
+        principal = krb5.cc_get_principal(ctx, cc)
+        realm = principal.realm.decode()
+        tgt_server = f"krbtgt/{realm}@{realm}"
 
-    for cred in cc:
-        if cred.server.realm == _CONFIG_ENTRY_REALM:
-            continue
-        if str(cred.server) == tgt_server:
-            times = cred.times
-            return CcacheInfo(
-                principal=str(principal),
-                realm=realm,
-                expires_at=datetime.fromtimestamp(times.endtime, tz=UTC),
-                renew_until=(
-                    datetime.fromtimestamp(times.renew_till, tz=UTC)
-                    if times.renew_till
-                    else None
-                ),
-            )
+        for cred in cc:
+            if cred.server.realm == _CONFIG_ENTRY_REALM:
+                continue
+            if str(cred.server) == tgt_server:
+                times = cred.times
+                return CcacheInfo(
+                    principal=str(principal),
+                    realm=realm,
+                    expires_at=datetime.fromtimestamp(times.endtime, tz=UTC),
+                    renew_until=(
+                        datetime.fromtimestamp(times.renew_till, tz=UTC)
+                        if times.renew_till
+                        else None
+                    ),
+                )
+    except krb5.Krb5Error as exc:
+        raise CcacheParseError(f"not a readable ccache: {exc}") from exc
 
     raise CcacheParseError(f"no {tgt_server} credential found in minted ccache")

@@ -82,14 +82,17 @@ code path gets this wrong).
 
 | Endpoint | Auth | Behavior |
 | --- | --- | --- |
-| `POST /v1/mint` | `Authorization: Bearer <AF Broker Identity Token>` | Body `{"username": str, "password": str, "lifetime": str, "renewable_lifetime": str}` (`lifetime`/`renewable_lifetime` optional, krb5 "time duration" strings — see below). Mints a Kerberos ticket via `kinit` for `<username>@CERN.CH`. Returns `{"ccache_b64", "principal", "realm", "expires_at", "renew_until"}` (`renew_until` is `null` when the ticket isn't renewable). 400 `{"detail": "bad password"}` or `{"detail": "unknown principal"}`; 403 when the CERN account itself is revoked or its password has expired (fixed, user-actionable detail — never kinit's raw stderr); 422 on an invalid `username`/`lifetime`; 429 after too many recent failed passwords for that username; 401 invalid/missing token; 502 on any other minting failure (generic detail — kinit's stderr is logged server-side only, never returned). |
+| `POST /v1/mint` | `Authorization: Bearer <AF Broker Identity Token>` | Body `{"username": str, "password": str, "lifetime": str, "renewable_lifetime": str}` **or** `{"username": str, "keytab_b64": str, "lifetime": str, "renewable_lifetime": str}` — exactly one of `password`/`keytab_b64` is required (422 otherwise); `lifetime`/`renewable_lifetime` optional, krb5 "time duration" strings — see below. Mints a Kerberos ticket via `kinit` (password on stdin, or `-kt` against the decoded keytab) for `<username>@CERN.CH`. Returns `{"ccache_b64", "principal", "realm", "expires_at", "renew_until"}` (`renew_until` is `null` when the ticket isn't renewable). 400 `{"detail": "bad password"}` / `{"detail": "bad keytab"}` / `{"detail": "unknown principal"}`; 403 when the CERN account itself is revoked or its password has expired (fixed, user-actionable detail — never kinit's raw stderr); 422 on an invalid `username`/`lifetime`/`keytab_b64`; 429 after too many recent failed passwords for that username (the keytab path never triggers this — see "Rate limiting" below); 401 invalid/missing token; 502 on any other minting failure (generic detail — kinit's stderr is logged server-side only, never returned). |
+| `POST /v1/renew` | `Authorization: Bearer <AF Broker Identity Token>` | Body `{"ccache_b64": str}` — a ccache this service minted earlier. Runs `kinit -R` on it; no credential is involved at all, so this never touches the rate limiter. Same response shape as `/v1/mint`. 422 `{"detail": "invalid ccache_b64"}` / `{"detail": "invalid ccache"}` when the input isn't valid base64 or isn't a real ccache (checked with `ccache.py` **before** `kinit` is ever invoked); 400 once the ticket is past its own `renew_until` — mint a fresh one via `/v1/mint` instead; 401/502 as above. |
+| `POST /v1/keytab` | `Authorization: Bearer <AF Broker Identity Token>` | Body `{"username": str, "password": str}`. Bootstraps a fresh keytab via CERN's own `cern-get-keytab` (patched — see below) and returns `{"keytab_b64", "principal"}`. **Never persists the keytab** — the caller (the broker) is responsible for storing it, e.g. in its own vault, for future `/v1/mint` keytab-mode calls. Shares the failed-auth rate limiter with `/v1/mint`'s password path (see "Rate limiting" below) — a wrong password here is a real check against the same CERN account. 400 `{"detail": "bad password"}`; 422 on an invalid `username`; 429 after too many recent failures; 401/502 as above. |
 | `GET /healthz` | none | Always 200. |
-| `GET /readyz` | none | 200 only when `kinit` is executable, `KRB5_CONFIG` is readable, and the broker JWKS is fetchable; 503 otherwise. Deliberately does **not** check CERN KDC reachability — a CERN-side outage must not flap this pod's readiness. |
+| `GET /readyz` | none | 200 only when `kinit` is executable, `KRB5_CONFIG` is readable, and the broker JWKS is fetchable; 503 otherwise. Deliberately does **not** check CERN KDC reachability (a CERN-side outage must not flap this pod's readiness) and does **not** check `cern-get-keytab`/`msktutil` (a bootstrap convenience with its own, slower CERN-side dependency — LDAP, not just the KDC — that must not flap readiness either). |
 
 Configuration is env-driven (`src/krb5_token_service/config.py`):
 `BROKER_JWKS_URL`, `BROKER_ISSUER`, `EXPECTED_AUDIENCE`, `KINIT_BIN`,
 `KRB5_CONFIG`, `DEFAULT_REALM`, `DEFAULT_LIFETIME`,
 `DEFAULT_RENEWABLE_LIFETIME`, `CCACHE_TMP_ROOT`, `KINIT_TIMEOUT_SECONDS`,
+`CERN_GET_KEYTAB_BIN`, `CERN_GET_KEYTAB_TIMEOUT_SECONDS`,
 `FAILED_AUTH_MAX_ATTEMPTS`, `FAILED_AUTH_WINDOW_SECONDS`,
 `FAILED_AUTH_LOCKOUT_SECONDS`, `JWKS_CACHE_TTL_SECONDS`, `LOG_LEVEL`.
 
@@ -141,6 +144,53 @@ principal reached CERN's real KDC and returned `Client
 'nonexistentuser@CERN.CH' not found in Kerberos database`, confirming the
 marker against a live response.
 
+## Renewal and keytab bootstrap
+
+Two more ways to get (or keep) a ticket besides a bare password mint:
+
+**`kinit -R` renewal (`/v1/renew`)** costs nothing to call — no password,
+no keytab, just the ccache this service minted earlier — but is capped at
+that ticket's own `renew_until` (the shipped `krb5.conf`'s `renew_lifetime
+= 7d`): past that, `kinit -R` fails with `"Ticket expired while renewing
+credentials"` and the caller must mint a fresh ticket instead.
+
+**Keytab-based minting (`/v1/mint` with `keytab_b64`)** trades a one-time
+password for a long-lived credential: a keytab lets `kinit -kt` mint fresh
+tickets indefinitely (each with its own fresh 7-day renew window) without
+ever re-supplying the password, and — unlike storing the plaintext password
+itself long-term — a leaked keytab is scoped to Kerberos and rotatable by
+kvno. This service never generates a keytab itself during a mint; it only
+consumes one the caller already has.
+
+**`POST /v1/keytab`** is how the caller gets that keytab in the first
+place, via CERN's own `cern-get-keytab` (`msktutil`-backed, since CERN's
+realm is an Active Directory domain). The upstream script is vendored
+as-is at `etc/cern-get-keytab`, with fixes applied as
+`etc/cern-get-keytab.patch` at image build time (`git apply`/`patch`,
+never hand-edited in place) — re-vendoring a newer upstream release just
+means dropping in the new file and re-applying the patch:
+
+- **A real shell-injection bug.** `call_msktutil` builds `--old-account-password '<password>'` (naive single-quote wrapping, no escaping) and runs the whole command line under `subprocess.Popen(..., shell=True)`. A password containing a single quote breaks out of the quoting into arbitrary shell execution inside this pod — this is CERN's own script, not something fixable upstream from here, so the patch wraps both occurrences in `shlex.quote()` instead.
+- **A stdin-based password input the script didn't have.** Non-interactively, `cern-get-keytab -u` only accepts `-p <password>` (visible in this pod's own `/proc/<pid>/cmdline` for the subprocess's lifetime) — `getpass.getpass()`'s interactive fallback explicitly reads `/dev/tty`, bypassing a redirected stdin entirely by design. The patch adds an `isatty()`-gated stdin read before that fallback, mirroring MIT `kinit`'s own `prompter.c` (`if (!isatty(fd))`) — see `mint_keytab`'s docstring in `minting.py`.
+- **Discarded failure diagnostics.** By default `cern-get-keytab` throws away `msktutil`'s stderr on failure entirely unless `--verbose` is passed, and even then only echoes the (already-redacted) command line, never the actual error. The patch surfaces it unconditionally so this service has something to classify a failure by at all.
+
+That last fix mattered in practice: verified against CERN's real Active
+Directory backend (a deliberately wrong password, never a real account),
+`msktutil`'s internal `--use-service-account` credential machinery is more
+involved than a single `krb5_get_init_creds_password` call — it tries
+several strategies (`msktkrb5.cpp`'s `try_machine_password` /
+`try_machine_supplied_password` / `try_user_creds`), and each one's own
+`"Preauthentication failed"`-style error lands on `cern-get-keytab`'s
+**stdout** (verbose progress output already printed unconditionally), not
+stderr. Only `msktutil`'s own top-level summary —
+`"Could not find any credentials to authenticate with..."` — reaches
+stderr, and only because of the patch's fourth fix above; without it, every
+`/v1/keytab` failure would have surfaced as a generic 502 rather than a 400.
+That summary also doesn't distinguish a wrong password from a genuinely
+unknown account the way `kinit`'s own errors do, so — unlike `/v1/mint` —
+there is no separate `unknown principal` outcome for `/v1/keytab`; both
+count as `bad password` and both count against the rate limiter.
+
 ## Rate limiting — unlike voms-token-service
 
 **voms-token-service deliberately has no rate limiter**: a wrong Globus
@@ -161,6 +211,13 @@ locks that username out for `FAILED_AUTH_LOCKOUT_SECONDS`) is a backstop:
 failure is counted **only** on a confirmed bad password — never on an
 unknown principal or an infra failure (KDC unreachable, timeout), neither of
 which is evidence of a guessing attempt.
+
+The limiter is keyed by username and shared across every path that actually
+checks a password against CERN: `/v1/mint`'s password mode and `/v1/keytab`
+both count against it (see "Renewal and keytab bootstrap" above for why
+`/v1/keytab` can't cleanly separate a bad password from an unknown account
+the way `/v1/mint` does — both count there). `/v1/mint`'s keytab mode and
+`/v1/renew` never touch it at all: neither involves a password.
 
 The limiter is in-process, per-replica state — see "Deployment" below for
 why the chart defaults to a single replica.
@@ -212,11 +269,18 @@ The `Containerfile` builds the runtime image: debian-slim plus the
 pixi-built Python environment. `kinit`/`klist` come from conda-forge's
 `krb5` package (`pixi.toml`'s `service` feature) — like voms-token-service's
 `voms` package, the Kerberos clients ride in the same pixi environment as
-the Python service, so the Containerfile needs no extra package-manager step
-beyond `ca-certificates` (for verifying the broker's JWKS TLS endpoint).
-Unlike voms-token-service's image (which deliberately carries no `USER`
-directive — its privilege model is entirely in the chart), this image sets
-`USER 1000:1000` directly, since nothing it does ever needs root.
+the Python service. `msktutil` (`cern-get-keytab`'s own Active-Directory
+dependency) isn't on conda-forge, so it comes from `apt` in the final stage
+instead, alongside `ca-certificates` (for verifying the broker's JWKS TLS
+endpoint) — the one package-manager step beyond the pixi env. The builder
+stage applies `etc/cern-get-keytab.patch` and only the already-patched
+script is copied into the final image; `/usr/bin/kinit`/`/usr/bin/klist` are
+symlinked to the pixi env's binaries there too, since `cern-get-keytab`
+hardcodes those absolute paths for its own (best-effort, non-load-bearing)
+KVNO reporting. Unlike voms-token-service's image (which deliberately
+carries no `USER` directive — its privilege model is entirely in the
+chart), this image sets `USER 1000:1000` directly, since nothing it does
+ever needs root.
 
 ## Local development
 
@@ -236,10 +300,12 @@ pixi run -e dev lint-all   # everything the CI lint job runs (ruff + mypy + pre-
 The default test suite never touches the network, a real CERN KDC, or a
 real filesystem beyond pytest's own `tmp_path`: the JWKS is served by an
 in-process stub around a real generated RSA keypair
-(`tests/conftest.py::stub_jwks_fetch`), and `kinit` is a fake executable
-shell script on `PATH` that writes a real, `pykrb5`-parseable FILE-ccache v4
-byte string as its output (`tests/ccache_fixtures.py` — verified against MIT
-krb5's own `doc/formats/ccache_file_format.rst` and
+(`tests/conftest.py::stub_jwks_fetch`), and `kinit`/`cern-get-keytab` are
+fake executables on `PATH` (or, for `cern-get-keytab`, a plain Python script
+pointed at directly, matching how `mint_keytab` really invokes it) covering
+every mode — password, `-kt`, `-R` — and writing a real, `pykrb5`-parseable
+FILE-ccache v4 byte string as their output (`tests/ccache_fixtures.py` —
+verified against MIT krb5's own `doc/formats/ccache_file_format.rst` and
 `src/lib/krb5/ccache/ccmarshal.c`, so `ccache.py`'s parsing exercises the
 real wire format, not a hand-rolled fake). `tests/test_e2e.py` is skipped
 unless `KRB5_E2E=1`, and requires a real deployment, a real broker-minted

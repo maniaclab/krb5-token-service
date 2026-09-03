@@ -64,11 +64,27 @@ class Settings(BaseSettings):
     # treated as an infra failure (502), not a bad password.
     kinit_timeout_seconds: int = Field(default=30, gt=0)
 
+    # Path to the patched cern-get-keytab this service ships (see
+    # etc/cern-get-keytab + etc/cern-get-keytab.patch; the Containerfile
+    # applies the patch at build time). Invoked under this process's own
+    # Python interpreter (sys.executable), never via its own shebang — see
+    # minting.mint_keytab.
+    cern_get_keytab_bin: str = "/app/etc/cern-get-keytab"
+
+    # Wall-clock bound on the cern-get-keytab subprocess. Separate from
+    # kinit_timeout_seconds: it talks to CERN's Active Directory over LDAP
+    # (via msktutil), a slower round trip than a plain KDC AS-REQ.
+    cern_get_keytab_timeout_seconds: int = Field(default=60, gt=0)
+
     # Per-username failed-authentication limiter. Unlike voms-token-service
     # (whose local openssl "bad decrypt" failure has no external consequence),
     # a wrong CERN password is a real AS-REQ that counts against CERN's own
     # account-lockout policy — so this service refuses to even invoke kinit
-    # once a username has failed too many times within the window. See
+    # once a username has failed too many times within the window. Shared
+    # between /v1/mint's password path and /v1/keytab (see minting.py's
+    # BadPasswordError docstring for why the latter risks the same CERN
+    # lockout counter) — never triggered by /v1/mint's keytab path or
+    # /v1/renew, neither of which involves a password at all. See
     # ratelimit.py and the Helm chart's replicaCount: 1 (this limiter is
     # in-process and per-replica).
     failed_auth_max_attempts: int = Field(default=3, gt=0)

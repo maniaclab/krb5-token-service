@@ -18,15 +18,27 @@ RUN echo '#!/bin/bash' > /app/entrypoint.sh && \
     echo 'exec "$@"' >> /app/entrypoint.sh && \
     chmod +x /app/entrypoint.sh
 
+# Apply etc/cern-get-keytab.patch here, not in the final stage: the final
+# image ships only the already-patched script, not `patch` itself or the
+# pristine original — see etc/cern-get-keytab.patch's own header for what
+# the two fixes are and why.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends patch && \
+    rm -rf /var/lib/apt/lists/* && \
+    patch etc/cern-get-keytab < etc/cern-get-keytab.patch
+
 # Final stage: debian:bookworm-slim, matching voms-token-service's
 # Containerfile layout (and staying binary-compatible with the pixi-built
 # environment copied from the builder stage). ca-certificates is needed at
-# runtime for httpx to verify the broker's JWKS TLS endpoint.
+# runtime for httpx to verify the broker's JWKS TLS endpoint. msktutil is
+# cern-get-keytab's own AD-facing dependency (not on conda-forge, hence apt
+# here rather than pixi.toml) — hardcoded by cern-get-keytab at exactly
+# /usr/sbin/msktutil, which is where this package installs it.
 FROM debian:bookworm-slim
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates msktutil && \
     rm -rf /var/lib/apt/lists/*
 
 # Keep the same absolute path as the builder stage: the entrypoint script's
@@ -35,7 +47,17 @@ RUN apt-get update && \
 COPY --from=builder /app/.pixi/envs/service /app/.pixi/envs/service
 COPY --from=builder /app/src /app/src
 COPY --from=builder /app/entrypoint.sh /app/entrypoint.sh
+COPY --from=builder /app/etc/cern-get-keytab /app/etc/cern-get-keytab
 COPY etc/krb5.conf /app/etc/krb5.conf
+
+# cern-get-keytab also hardcodes /usr/bin/kinit and /usr/bin/klist (for its
+# own --user-mode KVNO reporting) — this image's real kinit/klist live under
+# the pixi env instead, so symlink them into place. cern-get-keytab is
+# always invoked as `<this interpreter> /app/etc/cern-get-keytab ...`
+# (mint_keytab uses sys.executable, never the script's own
+# `#!/usr/bin/python3` shebang), so no /usr/bin/python3 is needed here.
+RUN ln -s /app/.pixi/envs/service/bin/kinit /usr/bin/kinit && \
+    ln -s /app/.pixi/envs/service/bin/klist /usr/bin/klist
 
 ENV PYTHONPATH="/app/src" \
     PYTHONDONTWRITEBYTECODE=1 \

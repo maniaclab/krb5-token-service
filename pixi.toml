@@ -29,6 +29,11 @@ krb5 = ">=1.21"
 # inside this workspace's exclude-newer window on a given day — 0.9's
 # builds are all long past that window.
 pykrb5 = ">=0.9"
+# Required by the vendored etc/cern-get-keytab (CERN's own keytab-issuance
+# tool — see etc/cern-get-keytab.patch) — it imports requests/yaml/urllib3
+# directly. urllib3 rides in transitively with requests.
+requests = ">=2.31"
+pyyaml = ">=6.0"
 # ca-certificates is pulled in transitively for httpx's JWKS TLS
 # verification; no grid/IGTF trust bundle is needed here (unlike
 # voms-token-service, this service verifies no X.509 chain of its own).

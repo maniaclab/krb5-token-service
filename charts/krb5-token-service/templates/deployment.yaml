@@ -69,6 +69,10 @@ spec:
               value: {{ .Values.config.defaultRenewableLifetime | quote }}
             - name: KINIT_TIMEOUT_SECONDS
               value: {{ .Values.config.kinitTimeoutSeconds | quote }}
+            - name: CERN_GET_KEYTAB_BIN
+              value: {{ .Values.config.cernGetKeytabBin | quote }}
+            - name: CERN_GET_KEYTAB_TIMEOUT_SECONDS
+              value: {{ .Values.config.cernGetKeytabTimeoutSeconds | quote }}
             - name: FAILED_AUTH_MAX_ATTEMPTS
               value: {{ .Values.config.failedAuthMaxAttempts | quote }}
             - name: FAILED_AUTH_WINDOW_SECONDS

@@ -60,6 +60,16 @@ config:
   defaultRenewableLifetime: "7d"
   # Wall-clock bound on the kinit subprocess (seconds).
   kinitTimeoutSeconds: 30
+  # Path to the patched cern-get-keytab this image ships (see
+  # etc/cern-get-keytab + etc/cern-get-keytab.patch, applied at image build
+  # time) — used only by POST /v1/keytab to bootstrap a fresh keytab from a
+  # password. Invoked under the service's own Python interpreter, never via
+  # this script's own shebang.
+  cernGetKeytabBin: "/app/etc/cern-get-keytab"
+  # Wall-clock bound on the cern-get-keytab subprocess (seconds) — longer
+  # than kinitTimeoutSeconds since it talks to CERN's Active Directory over
+  # LDAP (via msktutil), a slower round trip than a plain KDC AS-REQ.
+  cernGetKeytabTimeoutSeconds: 60
   # Per-username failed-authentication limiter — see the replicaCount note
   # above. A failure is only counted after a confirmed bad CERN password,
   # never for an unrelated infra failure (KDC unreachable, timeout).

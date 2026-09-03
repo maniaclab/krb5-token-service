@@ -171,6 +171,36 @@ def fake_ccache_bytes() -> bytes:
     )
 
 
+@pytest.fixture
+def fake_renewed_ccache_bytes() -> bytes:
+    """A second, distinguishable ccache standing in for kinit -R's output.
+
+    A different endtime than fake_ccache_bytes, so a test can prove the
+    response reflects a fresh post-renewal read rather than just echoing
+    back the pre-call input.
+    """
+    now = int(time.time())
+    return build_ccache(
+        username="gstark",
+        realm="CERN.CH",
+        authtime=now,
+        endtime=now + 172800,
+        renew_till=now + 604800,
+    )
+
+
+@pytest.fixture
+def fake_keytab_bytes() -> bytes:
+    """Arbitrary bytes standing in for a real keytab file's contents.
+
+    minting.py never parses keytab bytes itself (unlike a ccache) — it just
+    writes them to a tmpfs file and hands the path to kinit -kt — so these
+    don't need to be a real MIT keytab, only a fixed, comparable blob the
+    fake kinit script below can match against.
+    """
+    return b"\x05\x02fake-keytab-fixture-not-a-real-keytab-file"
+
+
 def _install_fake_bin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str
 ) -> Path:
@@ -234,6 +264,101 @@ def fake_kinit(
     return FakeKinit(path=script, args_file=args_file)
 
 
+# Shell fragment for -kt (keytab) mode: parse argv for -c (ccache out path)
+# and -t (keytab path); "succeed" only when the keytab file's content
+# byte-for-byte matches the fixture path FAKE_KEYTAB_PATH points at. Never
+# reads stdin — kinit -kt sends none (see minting.mint_ticket).
+_FAKE_BIN_KEYTAB_DISPATCH = """
+out=""
+keytab=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c) out="$2"; shift 2 ;;
+    -t) keytab="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+out="${out#FILE:}"
+if cmp -s "$keytab" "$FAKE_KEYTAB_PATH"; then
+  cp "$FAKE_CCACHE_PATH" "$out"
+  exit 0
+else
+  echo "kinit: Preauthentication failed while getting initial credentials" >&2
+  exit 1
+fi
+"""
+
+
+@pytest.fixture
+def fake_kinit_keytab(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_ccache_bytes: bytes,
+    fake_keytab_bytes: bytes,
+) -> FakeKinit:
+    """A fake kinit -kt on PATH: records argv, succeeds only for a byte-exact keytab match."""
+    ccache_source = tmp_path / "fake_source.ccache"
+    ccache_source.write_bytes(fake_ccache_bytes)
+    monkeypatch.setenv("FAKE_CCACHE_PATH", str(ccache_source))
+    keytab_source = tmp_path / "fake_source.keytab"
+    keytab_source.write_bytes(fake_keytab_bytes)
+    monkeypatch.setenv("FAKE_KEYTAB_PATH", str(keytab_source))
+    args_file = tmp_path / "kinit_keytab_args.txt"
+    script = _install_fake_bin(
+        tmp_path,
+        monkeypatch,
+        f'echo "$@" > "{args_file}"\n{_FAKE_BIN_KEYTAB_DISPATCH}',
+    )
+    return FakeKinit(path=script, args_file=args_file)
+
+
+# Shell fragment for -R (renew) mode: parse argv for -c only. The ccache
+# already at that path is what renew_ticket itself wrote before invoking
+# kinit -- "succeed" by overwriting it with a distinguishable renewed
+# fixture, so a test can prove the response reflects a fresh post-call read.
+_FAKE_BIN_RENEW_DISPATCH = """
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+out="${out#FILE:}"
+cp "$FAKE_RENEWED_CCACHE_PATH" "$out"
+exit 0
+"""
+
+
+@pytest.fixture
+def fake_kinit_renew(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_renewed_ccache_bytes: bytes,
+) -> FakeKinit:
+    """A fake kinit -R on PATH: always succeeds, overwriting the ccache with a renewed fixture."""
+    renewed_source = tmp_path / "fake_renewed.ccache"
+    renewed_source.write_bytes(fake_renewed_ccache_bytes)
+    monkeypatch.setenv("FAKE_RENEWED_CCACHE_PATH", str(renewed_source))
+    args_file = tmp_path / "kinit_renew_args.txt"
+    script = _install_fake_bin(
+        tmp_path,
+        monkeypatch,
+        f'echo "$@" > "{args_file}"\n{_FAKE_BIN_RENEW_DISPATCH}',
+    )
+    return FakeKinit(path=script, args_file=args_file)
+
+
+@pytest.fixture
+def ticket_expired_kinit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A fake kinit -R that always fails as a real kinit does past renew_until."""
+    return _install_fake_bin(
+        tmp_path,
+        monkeypatch,
+        _stderr_only_script("kinit: Ticket expired while renewing credentials"),
+    )
+
+
 def _stderr_only_script(message: str) -> str:
     return f'echo "{message}" >&2\nexit 1\n'
 
@@ -293,6 +418,65 @@ def unreachable_kdc_kinit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
 def hanging_kinit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A fake kinit that never returns — for timeout tests."""
     return _install_fake_bin(tmp_path, monkeypatch, "sleep 100")
+
+
+class FakeCernGetKeytab(NamedTuple):
+    path: Path
+    args_file: Path
+
+
+# A fake cern-get-keytab as a plain Python script (invoked as
+# `sys.executable <script> ...`, matching mint_keytab's real invocation — no
+# shebang or exec bit needed). Records argv, reads the password from stdin
+# (the patched real script's non-interactive input path — see
+# etc/cern-get-keytab.patch), and on a match copies the fixture keytab to
+# the --keytab path; on mismatch, prints the real msktutil/krb5 error text
+# etc/cern-get-keytab.patch's fourth hunk makes reach stderr (see
+# minting.py's _classify_cern_get_keytab_stderr docstring).
+_FAKE_CERN_GET_KEYTAB_SCRIPT = f"""
+import os
+import shutil
+import sys
+
+argv = sys.argv[1:]
+with open(os.environ["FAKE_CGK_ARGS_FILE"], "w") as f:
+    f.write(" ".join(argv))
+
+keytab_path = None
+for i, arg in enumerate(argv):
+    if arg == "--keytab":
+        keytab_path = argv[i + 1]
+
+password = sys.stdin.readline().rstrip("\\n")
+if password == "{FAKE_CORRECT_PASSWORD}":
+    shutil.copy(os.environ["FAKE_KEYTAB_PATH"], keytab_path)
+    sys.exit(0)
+else:
+    print(
+        "Error: krb5_get_init_creds_password failed: Preauthentication failed",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+"""
+
+
+@pytest.fixture
+def fake_cern_get_keytab(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_keytab_bytes: bytes,
+    settings: Settings,
+) -> FakeCernGetKeytab:
+    """A fake cern-get-keytab: points settings.cern_get_keytab_bin at a script under this fixture's control."""
+    keytab_source = tmp_path / "fake_bootstrap_source.keytab"
+    keytab_source.write_bytes(fake_keytab_bytes)
+    monkeypatch.setenv("FAKE_KEYTAB_PATH", str(keytab_source))
+    args_file = tmp_path / "cern_get_keytab_args.txt"
+    monkeypatch.setenv("FAKE_CGK_ARGS_FILE", str(args_file))
+    script_path = tmp_path / "fake-cern-get-keytab.py"
+    script_path.write_text(_FAKE_CERN_GET_KEYTAB_SCRIPT)
+    settings.cern_get_keytab_bin = str(script_path)
+    return FakeCernGetKeytab(path=script_path, args_file=args_file)
 
 
 @pytest.fixture
