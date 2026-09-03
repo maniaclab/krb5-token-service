@@ -1,0 +1,161 @@
+# Default values for krb5-token-service.
+#
+# Unlike voms-token-service (the only component in the af-mcp-platform that
+# mounts user home directories, because voms-proxy-init must read
+# ~/.globus/{usercert,userkey}.pem), kinit needs no on-disk user credential
+# — the CERN password on the wire is the entire credential. This service
+# therefore mounts nothing but its own private tmpfs scratch space and runs
+# as a single unprivileged uid for its whole lifetime.
+
+# Single replica: the per-username failed-attempt limiter (config.failedAuth*)
+# is in-process state. Scaling this deployment up silently multiplies the
+# effective attempt budget against the same CERN account before this
+# service's own limiter kicks in — see src/krb5_token_service/ratelimit.py.
+# The broker's own throttle is still the primary defense; this limiter is a
+# backstop. If you must run more than one replica, lower
+# config.failedAuthMaxAttempts so (maxAttempts * replicaCount) stays well
+# under CERN's real lockout threshold.
+replicaCount: 1
+
+image:
+  registry: ghcr.io
+  repository: maniaclab/krb5-token-service
+  # Defaults to the chart's appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Pull secret(s) for the registry above (ghcr packages default to private),
+# e.g. [{name: ghcr-pull-secret}] with the SealedSecret deployed alongside.
+imagePullSecrets: []
+
+nodeSelector: {}
+affinity: {}
+tolerations: []
+
+# Environment for the service (see src/krb5_token_service/config.py for the
+# full documentation of each setting).
+config:
+  # Where the broker publishes the JWKS for its AF Broker Identity Token
+  # signing keys (maniaclab/af-mcp-platform#162). Must agree with the
+  # networkPolicy.jwks egress rule below: the default fetches IN-CLUSTER,
+  # matching the default egress selectors. This is a fetch location only;
+  # iss validation is brokerIssuer below.
+  brokerJwksUrl: "http://af-mcp-platform-broker.mcp.svc.cluster.local:8080/.well-known/jwks.json"
+  # Required `iss` claim on inbound identity tokens.
+  brokerIssuer: "https://mcp.af.uchicago.edu"
+  # Required `aud` claim — this service's identity in the protocol.
+  expectedAudience: "krb5-token-service"
+  # Path to (or PATH-resolved name of) the kinit binary in the container image.
+  kinitBin: "kinit"
+  # Path to the krb5.conf used by the running container — baked into the
+  # image at etc/krb5.conf by default, or the ConfigMap-mounted path below
+  # when krb5Config.override is set. Exported to kinit as KRB5_CONFIG.
+  krb5Config: "/app/etc/krb5.conf"
+  # Kerberos realm appended to a bare username (see minting.validate_username
+  # — a request can never smuggle its own realm).
+  defaultRealm: "CERN.CH"
+  # Defaults applied when a mint request omits lifetime/renewable_lifetime.
+  # Mirror the shipped krb5.conf's ticket_lifetime/renew_lifetime.
+  defaultLifetime: "24h"
+  defaultRenewableLifetime: "7d"
+  # Wall-clock bound on the kinit subprocess (seconds).
+  kinitTimeoutSeconds: 30
+  # Per-username failed-authentication limiter — see the replicaCount note
+  # above. A failure is only counted after a confirmed bad CERN password,
+  # never for an unrelated infra failure (KDC unreachable, timeout).
+  failedAuthMaxAttempts: 3
+  failedAuthWindowSeconds: 900
+  failedAuthLockoutSeconds: 900
+  logLevel: "INFO"
+
+# Extra environment variables (name: value) appended verbatim.
+env: {}
+
+# krb5.conf delivery. By default the file baked into the image
+# (etc/krb5.conf) is used as-is — a CERN KDC change requires a release,
+# matching voms-token-service's "no ConfigMap, all configuration is
+# env-from-values" stance for its own trust material. Set override: true to
+# instead render `contents` into a ConfigMap mounted over config.krb5Config,
+# so a KDC hostname change needs no image rebuild.
+krb5Config:
+  override: false
+  contents: |
+    [libdefaults]
+      default_realm = CERN.CH
+      ticket_lifetime = 24h
+      renew_lifetime = 7d
+      forwardable = true
+      proxiable = true
+
+    [realms]
+      CERN.CH = {
+        default_domain = cern.ch
+        kpasswd_server = afskrb5m.cern.ch
+        admin_server = afskrb5m.cern.ch
+        kdc = cerndc.cern.ch
+      }
+
+    [domain_realm]
+      cern.ch = CERN.CH
+      .cern.ch = CERN.CH
+
+# Pod-level security context. Unlike voms-token-service, no capability is
+# added here at all: kinit needs no on-disk user credential, so nothing
+# requires root or CAP_DAC_READ_SEARCH.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+
+service:
+  # ClusterIP only — the sole intended client is the in-cluster broker.
+  port: 8080
+
+networkPolicy:
+  enabled: true
+  # Ingress: ONLY the broker pods may reach the minting endpoint. Defaults
+  # match the production af-mcp-platform deployment: namespace `mcp`, broker
+  # pods labeled name=af-mcp-platform + component=broker.
+  broker:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: mcp
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: af-mcp-platform
+        app.kubernetes.io/component: broker
+  # Egress: besides DNS, ONLY the origin serving config.brokerJwksUrl.
+  # Defaults assume the JWKS is served by the same in-cluster broker pods;
+  # if the JWKS is only reachable via an external ingress, replace the
+  # selectors with an ipBlock-based rule for that origin.
+  jwks:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: mcp
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: af-mcp-platform
+        app.kubernetes.io/component: broker
+    port: 8080
+  # Egress: the CERN KDC(s) kinit actually contacts (etc/krb5.conf's
+  # kdc = cerndc.cern.ch). External to the cluster, hence an ipBlock rule —
+  # 0.0.0.0/0 by default (restrict this to CERN's real KDC IPs/CIDRs in
+  # production; DNS names can't be used directly in a NetworkPolicy). Port
+  # 88 is opened on both UDP and TCP — see templates/networkpolicy.yaml.
+  kdc:
+    cidr: "0.0.0.0/0"
+    port: 88
+
+# e.g. {limits: {memory: 256Mi}, requests: {cpu: 50m, memory: 128Mi}}
+resources: {}
+
+nameOverride: ""
+fullnameOverride: ""

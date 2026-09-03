@@ -1,0 +1,13 @@
+{{- if .Values.krb5Config.override }}
+# Only rendered when krb5Config.override is set — the default deployment
+# uses the krb5.conf baked into the image (etc/krb5.conf) as-is.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "krb5-token-service.fullname" . }}-krb5-conf
+  labels:
+    {{- include "krb5-token-service.labels" . | nindent 4 }}
+data:
+  krb5.conf: |
+    {{- .Values.krb5Config.contents | nindent 4 }}
+{{- end }}

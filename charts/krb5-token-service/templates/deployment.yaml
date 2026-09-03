@@ -1,0 +1,125 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "krb5-token-service.fullname" . }}
+  labels:
+    {{- include "krb5-token-service.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "krb5-token-service.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "krb5-token-service.selectorLabels" . | nindent 8 }}
+    spec:
+      # This pod never talks to the Kubernetes API and mounts no shared
+      # storage — withholding the ServiceAccount token removes an entire
+      # credential class it has no use for.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Unlike voms-token-service, no elevated capability is needed here at
+      # all: kinit needs no on-disk user credential, so a single
+      # unprivileged uid can do everything this pod does.
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: krb5-token-service
+          image: {{ include "krb5-token-service.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Names must match Settings fields (config.py).
+            - name: BROKER_JWKS_URL
+              value: {{ .Values.config.brokerJwksUrl | quote }}
+            - name: BROKER_ISSUER
+              value: {{ .Values.config.brokerIssuer | quote }}
+            - name: EXPECTED_AUDIENCE
+              value: {{ .Values.config.expectedAudience | quote }}
+            - name: KINIT_BIN
+              value: {{ .Values.config.kinitBin | quote }}
+            - name: KRB5_CONFIG
+              value: {{ .Values.config.krb5Config | quote }}
+            - name: DEFAULT_REALM
+              value: {{ .Values.config.defaultRealm | quote }}
+            - name: DEFAULT_LIFETIME
+              value: {{ .Values.config.defaultLifetime | quote }}
+            - name: DEFAULT_RENEWABLE_LIFETIME
+              value: {{ .Values.config.defaultRenewableLifetime | quote }}
+            - name: KINIT_TIMEOUT_SECONDS
+              value: {{ .Values.config.kinitTimeoutSeconds | quote }}
+            - name: FAILED_AUTH_MAX_ATTEMPTS
+              value: {{ .Values.config.failedAuthMaxAttempts | quote }}
+            - name: FAILED_AUTH_WINDOW_SECONDS
+              value: {{ .Values.config.failedAuthWindowSeconds | quote }}
+            - name: FAILED_AUTH_LOCKOUT_SECONDS
+              value: {{ .Values.config.failedAuthLockoutSeconds | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            # Extra env vars from values (name: value pairs)
+            {{- range $key, $val := .Values.env }}
+            - name: {{ $key | quote }}
+              value: {{ $val | quote }}
+            {{- end }}
+          volumeMounts:
+            # readOnlyRootFilesystem requires an explicit writable /tmp:
+            # each mint gets a private working dir here (config.py's
+            # ccache_tmp_root) holding the ccache until it's read back into
+            # memory. tmpfs-backed (Memory) so ticket material never
+            # touches disk, even transiently.
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.krb5Config.override }}
+            # Overlays the baked-in krb5.conf with the ConfigMap's contents
+            # at the exact path KRB5_CONFIG points at, so no env override is
+            # needed alongside this.
+            - name: krb5-conf
+              mountPath: {{ .Values.config.krb5Config }}
+              subPath: krb5.conf
+              readOnly: true
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            # readyz verifies kinit is executable, KRB5_CONFIG is readable,
+            # and the broker JWKS is fetchable — deliberately not KDC
+            # reachability, which would let a CERN-side outage flap this pod.
+            httpGet:
+              path: /readyz
+              port: http
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+        {{- if .Values.krb5Config.override }}
+        - name: krb5-conf
+          configMap:
+            name: {{ include "krb5-token-service.fullname" . }}-krb5-conf
+        {{- end }}

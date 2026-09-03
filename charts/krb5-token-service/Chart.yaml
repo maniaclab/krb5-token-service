@@ -1,0 +1,14 @@
+apiVersion: v2
+name: krb5-token-service
+description: Kerberos ticket minting for the UChicago ATLAS Analysis Facility MCP platform
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords: [kerberos, krb5, kinit, mcp, atlas, hep, analysis-facility, cern]
+home: https://github.com/maniaclab/krb5-token-service
+sources: [https://github.com/maniaclab/krb5-token-service]
+maintainers:
+  # Giordon Stark
+  - name: kratsg
+    email: kratsg@gmail.com
+    url: https://github.com/kratsg

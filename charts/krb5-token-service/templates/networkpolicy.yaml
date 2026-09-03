@@ -1,0 +1,62 @@
+{{- if .Values.networkPolicy.enabled }}
+# Ingress: ONLY the broker pods may reach the minting endpoint.
+# Egress: DNS, the origin serving the broker's JWKS, and the CERN KDC(s)
+# kinit actually contacts.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "krb5-token-service.fullname" . }}
+  labels:
+    {{- include "krb5-token-service.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "krb5-token-service.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.broker.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.broker.podSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+
+  egress:
+    # DNS — required to resolve the JWKS and KDC origins.
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # The broker's JWKS endpoint (config.brokerJwksUrl) — the service's
+    # only in-cluster outbound dependency.
+    - to:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.jwks.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.jwks.podSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.jwks.port }}
+
+    # The CERN KDC(s) kinit contacts (etc/krb5.conf's kdc = cerndc.cern.ch)
+    # — external to the cluster, hence an ipBlock rule rather than a
+    # namespace/pod selector. Restrict networkPolicy.kdc.cidr to CERN's real
+    # KDC IPs/CIDRs in production. Both protocols are required: MIT krb5
+    # tries UDP first and falls back to TCP when a reply doesn't fit in one
+    # UDP datagram — allowing only one silently breaks minting.
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.kdc.cidr | quote }}
+      ports:
+        - protocol: UDP
+          port: {{ .Values.networkPolicy.kdc.port }}
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.kdc.port }}
+{{- end }}

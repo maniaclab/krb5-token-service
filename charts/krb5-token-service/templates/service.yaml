@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "krb5-token-service.fullname" . }}
+  labels:
+    {{- include "krb5-token-service.labels" . | nindent 4 }}
+spec:
+  # ClusterIP only: the sole intended client is the in-cluster broker, and
+  # the NetworkPolicy enforces exactly that.
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "krb5-token-service.selectorLabels" . | nindent 4 }}
