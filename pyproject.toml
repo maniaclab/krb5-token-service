@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "krb5-token-service"
-version = "0.1.0"
+version = "0.2.0"
 description = "Kerberos ticket minting for the UChicago ATLAS Analysis Facility MCP platform"
 requires-python = ">=3.12"
 # Dependencies are managed by pixi — see pixi.toml at the workspace root.

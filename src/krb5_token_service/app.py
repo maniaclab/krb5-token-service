@@ -655,7 +655,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application = FastAPI(
         title="krb5-token-service",
         description="Kerberos ticket minting for the AF MCP platform",
-        version="0.1.0",
+        version="0.2.0",
     )
     application.state.settings = settings
     application.state.rate_limiter = RateLimiter(
