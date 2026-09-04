@@ -249,7 +249,10 @@ privilege model this service needs:
   stance for its own trust material. Set `krb5Config.override: true` to
   instead render `krb5Config.contents` into a ConfigMap mounted over that
   same path via `subPath`, so a CERN KDC hostname change needs no image
-  rebuild.
+  rebuild. Depending on your resolver/network setup, you may need to add
+  `dns_canonicalize_hostname = false` under `[libdefaults]` in that
+  overridden config to stop the DNS lookup from canonicalizing the KDC
+  hostname — confirmed necessary at UChicago's AF.
 - **NetworkPolicy** — ingress only from the broker pods; egress limited to
   DNS, the broker JWKS origin, and the CERN KDC(s) `kinit` contacts, opened
   on **both UDP and TCP port 88** (all `ipBlock` rules, since these servers
