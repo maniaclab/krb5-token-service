@@ -156,7 +156,13 @@ async def verify_broker_token(token: str, settings: Settings) -> dict[str, Any]:
                     "require": ["exp", "iat", "sub"],
                 },
             )
-    except jwt.InvalidTokenError as exc:
+    except jwt.PyJWTError as exc:
+        # PyJWTError (not just InvalidTokenError) so that
+        # RSAAlgorithm.from_jwk's InvalidKeyError — raised for a malformed
+        # or non-RSA JWKS entry — is classified as a 401 like any other
+        # verification failure, rather than escaping uncaught as an
+        # unaudited 500. InvalidKeyError is a PyJWTError but not an
+        # InvalidTokenError.
         error = exc
     except (ValueError, KeyError) as exc:
         error = exc

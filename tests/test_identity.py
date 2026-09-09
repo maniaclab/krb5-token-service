@@ -75,6 +75,28 @@ class TestVerifyBrokerToken:
             await identity.verify_broker_token(token, settings)
         assert excinfo.value.status_code == 401
 
+    async def test_malformed_jwks_key_is_401(
+        self,
+        make_token: Callable[..., str],
+        settings: Settings,
+        stub_jwks_fetch: JwksFetchStub,
+    ) -> None:
+        # A JWKS entry with no n/e is what a broker key-rotation glitch (or
+        # a stray non-RSA key) can publish. RSAAlgorithm.from_jwk raises
+        # jwt.InvalidKeyError for it, which must be classified as a 401
+        # like any other verification failure, not escape as an unhandled
+        # 500. Reassign .keys rather than appending in place — jwks is
+        # session-scoped, so mutating it here would leak into other tests.
+        malformed_kid = "malformed-key"
+        stub_jwks_fetch.keys = [
+            *stub_jwks_fetch.keys,
+            {"kid": malformed_kid, "kty": "RSA", "use": "sig"},
+        ]
+        token = make_token(kid=malformed_kid)
+        with pytest.raises(HTTPException) as excinfo:
+            await identity.verify_broker_token(token, settings)
+        assert excinfo.value.status_code == 401
+
     @pytest.mark.parametrize("claim", ["exp", "iat", "sub"])
     async def test_missing_required_claim_is_401(
         self, make_token: Callable[..., str], settings: Settings, claim: str
